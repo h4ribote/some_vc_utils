@@ -36,7 +36,7 @@ async def create_claim_embed(vc_client:VirtualCryptoClient, payer_id:int, unit:s
     claim_embed.add_field(name="数量", value=f"{amount} {unit}")
     claim_embed.add_field(name="内容", value=claim_info, inline=False)
     claim_embed.add_field(name="承認用コマンド", value=f"/claim approve id:{new_claim.id}", inline=False)
-    claim_embed.footer.text = f"注意: 請求は最大{expire_min}分間有効です"
+    claim_embed.set_footer(text=f"注意: 請求は最大{expire_min}分間有効です")
     return claim_embed, new_claim
 
 @app_commands.command(name="rain",description="通貨を特定のロールのメンバーに配ります")
@@ -78,7 +78,6 @@ async def rain(interaction:Interaction, unit:str, amount_per_user:int, role:Role
 
     except Exception as e:
         await interaction.edit_original_response(embed=Embed(title="内部エラー", description=f"{e.__class__.__name__}:\n{e}", colour=embedColour.Error))
-        raise e
 
     finally:
         try:
@@ -143,7 +142,7 @@ async def send_with_msg(interaction:Interaction, unit:str, user:Member, amount:i
 @app_commands.command(name="receive_msg",description="/send_with_msgの内容をDMで通知します")
 @app_commands.describe(receive_config="[True]DMを受け取る [False]DMを受け取らない")
 async def receive_msg(interaction:Interaction, receive_config:bool):
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
     try:
         cursor = DBConnection.cursor()
         if receive_config:
@@ -158,7 +157,6 @@ async def receive_msg(interaction:Interaction, receive_config:bool):
     except Exception as e:
         DBConnection.rollback()
         await interaction.edit_original_response(embed=Embed(title="内部エラー", description=f"{type(e).__name__}:\n{e}", colour=embedColour.Error))
-        raise e
     finally:
         try: cursor.close()
         except UnboundLocalError: pass
