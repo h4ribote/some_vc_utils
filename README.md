@@ -1,6 +1,6 @@
 # Some VC Utils
 
-「Some VC Utils」は、Discord上で[VirtualCrypto](https://vcrypto.sumidora.com)という通貨サービスを簡単に利用するためのユーティリティボットです。  
+「Some VC Utils」は、Discord上で[VirtualCrypto](https://vcrypto.sumidora.com)を簡単に利用するためのユーティリティボットです。  
 特定のロールを持つメンバーへの通貨の配布や、メッセージ付きの送金など、VirtualCryptoをより便利に活用するための機能を提供します。
 
 ## 主な機能
