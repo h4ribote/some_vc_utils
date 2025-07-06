@@ -6,6 +6,8 @@ import config
 intents = discord.Intents.default()
 intents.members = True
 intents.presences = True
+intents.message_content = True 
+
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
@@ -38,7 +40,7 @@ async def on_message(message:discord.Message):
         return
 
     if message.guild:
-        await cmds.handle_message_reward(message)
+        await cmds.handle_reward('message', message.author, message.guild)
 
     if message.content.startswith(f"<@{client.user.id}>") and message.author.id in config.Discord.ADMIN:
         parts = message.content.split(' ')
