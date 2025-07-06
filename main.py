@@ -19,6 +19,8 @@ async def on_ready():
     tree.add_command(cmds.receive_msg)
     tree.add_command(cmds.admin_refresh)
 
+    tree.add_command(cmds.reward_pool)
+
     @tree.command(name="help",description="主要なコマンドの使い方を表示します")
     async def help_command(interaction:discord.Interaction):
         await interaction.response.defer(thinking=True)
@@ -37,10 +39,16 @@ async def on_ready():
 
 @client.event
 async def on_message(message:discord.Message):
+    if message.author.bot:
+        return
+
+    if message.guild:
+        await cmds.handle_message_reward(message)
+
     if message.content.startswith(f"<@{client.user.id}>") and message.author.id in config.Discord.ADMIN:
-        if message.content.split(' ')[1] == "kill":
+        parts = message.content.split(' ')
+        if len(parts) > 1 and parts[1] == "kill":
             await client.close()
-            await client._connection.close()
             exit()
 
 client.run(config.Discord.BOT_TOKEN)
