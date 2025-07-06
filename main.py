@@ -21,11 +21,6 @@ async def on_ready():
 
     tree.add_command(cmds.reward_pool)
 
-    @tree.command(name="help",description="主要なコマンドの使い方を表示します")
-    async def help_command(interaction:discord.Interaction):
-        await interaction.response.defer(thinking=True)
-        await interaction.followup.send(embeds=cmds.bot_help())
-
     @tree.command(name="info",description="このボットに関する情報を表示します")
     async def info_command(interaction:discord.Interaction):
         await interaction.response.defer(thinking=True)

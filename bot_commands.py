@@ -48,10 +48,15 @@ cursor.execute("""
 """)
 DBConnection.commit()
 cursor.close()
-def bot_info() -> Embed:
-    ...
 
-async def create_claim_embed(vc_client:VirtualCryptoClient, payer_id:int, unit:str, amount:int, claim_info:str, expire_min:int = 2) -> tuple[Embed, Claim]:
+def bot_info() -> Embed:
+    embed = Embed(title="Some VC Utils", description="VirtualCryptoと連携してDiscordサーバーで通貨を便利に使うためのBotです", color=embedColour.LightBlue)
+    embed.add_field(name="開発者", value="h4ribote", inline=False)
+    embed.add_field(name="GitHub", value="https://github.com/h4ribote/some_vc_utils", inline=False)
+    embed.add_field(name="サポートサーバー", value="https://discord.gg/rqpSGFSRUH", inline=False)
+    return embed
+
+async def create_claim_embed(vc_client:AsyncVirtualCryptoClient, payer_id:int, unit:str, amount:int, claim_info:str, expire_min:int = 2) -> tuple[Embed, Claim]:
     new_claim = await vc_client.create_claim(payer_id, unit, amount)
     claim_embed = Embed(title="請求を発行しました", colour=embedColour.LightBlue)
     claim_embed.description = "下記の通り請求を発行しました\nVirtualCryptoから承認してください"
