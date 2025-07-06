@@ -463,7 +463,7 @@ async def handle_reward(reward_type: str, user: discord.Member, guild: discord.G
             (user.id, guild.id, reward_type, current_time)
         )
         DBConnection.commit()
-        print(f"[Guild_{guild.id}] Rewarded {config.amount} {pool.unit} to {user.name} for '{reward_type}'.")
+        # print(f"[Guild_{guild.id}] Rewarded {config.amount} {pool.unit} to {user.name} for '{reward_type}'.")
 
     except Exception as e:
         DBConnection.rollback()
