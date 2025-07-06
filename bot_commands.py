@@ -24,7 +24,30 @@ def dict_factory(cursor, row):
     return d
 
 DBConnection.row_factory = dict_factory
-
+cursor = DBConnection.cursor()
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS reward_pools (
+        guild_id INTEGER PRIMARY KEY,
+        unit TEXT NOT NULL,
+        msg_reward_amount INTEGER NOT NULL,
+        pool_balance INTEGER NOT NULL DEFAULT 0
+    )
+""")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS user_last_message (
+        user_id INTEGER,
+        guild_id INTEGER,
+        last_timestamp INTEGER NOT NULL,
+        PRIMARY KEY (user_id, guild_id)
+    )
+""")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS receive_msg (
+        user_id INTEGER PRIMARY KEY
+    )
+""")
+DBConnection.commit()
+cursor.close()
 def bot_info() -> Embed:
     ...
 
@@ -44,9 +67,12 @@ async def create_claim_embed(vc_client:VirtualCryptoClient, payer_id:int, unit:s
 async def rain(interaction:Interaction, unit:str, amount_per_user:int, role:Role):
     await interaction.response.defer(thinking=True)
     try:
-        VC_Client = await VCClient()
         role_mems = role.members
         member_count = len(role_mems)
+        if member_count == 0:
+            await interaction.edit_original_response(embed=Embed(title="エラー", description="対象ロールにメンバーがいません。", colour=embedColour.Error))
+            return
+        VC_Client = await VCClient()
         amount = amount_per_user*member_count
         claim_embed, new_claim = await create_claim_embed(VC_Client, interaction.user.id, unit, amount, f"通貨のエアドロップ({amount_per_user} * {member_count})")
         await interaction.followup.send(embeds=[claim_embed])
@@ -160,6 +186,175 @@ async def receive_msg(interaction:Interaction, receive_config:bool):
     finally:
         try: cursor.close()
         except UnboundLocalError: pass
+
+
+reward_pool = app_commands.Group(name="reward_pool", description="サーバー内の報酬に関する設定")
+
+@reward_pool.command(name="setup", description="報酬プールの設定をします (管理者向け)")
+@app_commands.describe(unit="通貨単位", msg_reward_amount="メッセージの報酬として付与する量")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def reward_pool_setup(interaction: Interaction, unit: str, msg_reward_amount: int):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    if msg_reward_amount <= 0:
+        await interaction.followup.send(embed=Embed(title="エラー", description="報酬量は0より大きい値を設定してください。", colour=embedColour.Error))
+        return
+        
+    try:
+        cursor = DBConnection.cursor()
+        cursor.execute(
+            "INSERT INTO reward_pools (guild_id, unit, msg_reward_amount) VALUES (?, ?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET unit=excluded.unit, msg_reward_amount=excluded.msg_reward_amount",
+            (interaction.guild_id, unit, msg_reward_amount)
+        )
+        DBConnection.commit()
+        embed = Embed(title="設定完了", description="報酬プールの設定を保存しました。", colour=embedColour.Success)
+        embed.add_field(name="通貨単位", value=unit)
+        embed.add_field(name="報酬量", value=str(msg_reward_amount))
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        DBConnection.rollback()
+        await interaction.followup.send(embed=Embed(title="内部エラー", description=f"{type(e).__name__}:\n{e}", colour=embedColour.Error))
+    finally:
+        try: cursor.close()
+        except UnboundLocalError: pass
+
+@reward_pool.command(name="info", description="報酬プールの現在の情報を表示します")
+async def reward_pool_info(interaction: Interaction):
+    await interaction.response.defer(thinking=True)
+    try:
+        cursor = DBConnection.cursor()
+        cursor.execute("SELECT * FROM reward_pools WHERE guild_id = ?", (interaction.guild_id,))
+        pool_data = cursor.fetchone()
+        if not pool_data:
+            await interaction.followup.send(embed=Embed(title="情報", description="このサーバーでは報酬プールがまだ設定されていません。", colour=embedColour.Yellow))
+            return
+        
+        embed = Embed(title="報酬プール情報", description=f"{interaction.guild.name}の現在の設定です。", colour=embedColour.LightBlue)
+        embed.add_field(name="プール残高", value=f"{pool_data['pool_balance']} {pool_data['unit']}", inline=False)
+        embed.add_field(name="メッセージ報酬", value=f"{pool_data['msg_reward_amount']} {pool_data['unit']}")
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await interaction.followup.send(embed=Embed(title="内部エラー", description=f"{type(e).__name__}:\n{e}", colour=embedColour.Error))
+    finally:
+        try: cursor.close()
+        except UnboundLocalError: pass
+
+@reward_pool.command(name="deposit", description="報酬プールに通貨を補充します (管理者向け)")
+@app_commands.describe(amount="補充する数量")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def reward_pool_deposit(interaction: Interaction, amount: int):
+    await interaction.response.defer(thinking=True)
+    VC_Client = None
+    try:
+        cursor = DBConnection.cursor()
+        cursor.execute("SELECT unit FROM reward_pools WHERE guild_id = ?", (interaction.guild_id,))
+        pool_data = cursor.fetchone()
+        if not pool_data:
+            await interaction.edit_original_response(embed=Embed(title="エラー", description="先に`/reward_pool setup`で報酬プールを設定してください。", colour=embedColour.Error))
+            return
+        if amount <= 0:
+            await interaction.edit_original_response(embed=Embed(title="エラー", description="補充する数量は0より大きい値を設定してください。", colour=embedColour.Error))
+            return
+
+        unit = pool_data['unit']
+        VC_Client = await VCClient()
+        claim_embed, new_claim = await create_claim_embed(VC_Client, interaction.user.id, unit, amount, f"報酬プールへの補充")
+        await interaction.followup.send(embeds=[claim_embed])
+
+        for i in range(12):
+            await asyncio.sleep(10)
+            new_claim = await VC_Client.get_claim(new_claim.id)
+            if new_claim.status == ClaimStatus.Approved:
+                break
+            elif new_claim.status in [ClaimStatus.Denied, ClaimStatus.Canceled]:
+                cancel_embed = Embed(description="請求はキャンセルまたは拒否されました", colour=embedColour.Error)
+                i = 12
+            if i == 11:
+                await VC_Client.update_claim(new_claim.id, ClaimStatus.Canceled)
+                cancel_embed = Embed(description="操作はタイムアウトしました", colour=embedColour.Error)
+                i = 12
+            if i == 12:
+                await interaction.edit_original_response(embeds=[claim_embed, cancel_embed])
+                await VC_Client.close()
+                return
+        
+        cursor.execute(
+            "UPDATE reward_pools SET pool_balance = pool_balance + ? WHERE guild_id = ?",
+            (amount, interaction.guild_id)
+        )
+        DBConnection.commit()
+        
+        confirm_embed = Embed(title="処理が完了しました", colour=embedColour.Success)
+        confirm_embed.description = f"請求`{new_claim.id}`は承認され、プールに **{amount} {unit}** が補充されました。"
+        await interaction.edit_original_response(embeds=[claim_embed, confirm_embed])
+
+    except Exception as e:
+        DBConnection.rollback()
+        await interaction.edit_original_response(embed=Embed(title="内部エラー", description=f"{e.__class__.__name__}:\n{e}", colour=embedColour.Error))
+    finally:
+        try:
+            cursor.close()
+            if VC_Client and not VC_Client.session.closed:
+                 await VC_Client.close()
+        except (UnboundLocalError, AttributeError): pass
+
+async def handle_message_reward(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+
+    cursor = DBConnection.cursor()
+    try:
+        cursor.execute("SELECT * FROM reward_pools WHERE guild_id = ?", (message.guild.id,))
+        pool_data = cursor.fetchone()
+        if not pool_data:
+            return
+
+        msg_reward_amount = pool_data['msg_reward_amount']
+        unit = pool_data['unit']
+
+        if pool_data['pool_balance'] < msg_reward_amount:
+            return
+
+        current_time = int(time())
+        cursor.execute(
+            "SELECT last_timestamp FROM user_last_message WHERE user_id = ? AND guild_id = ?",
+            (message.author.id, message.guild.id)
+        )
+        last_message_data = cursor.fetchone()
+
+        if last_message_data and (current_time - last_message_data['last_timestamp']) < 600:
+            return
+
+        VC_Client = None
+        try:
+            VC_Client = await VCClient()
+            await VC_Client.pay(unit, message.author.id, msg_reward_amount)
+
+            cursor.execute(
+                "UPDATE reward_pools SET pool_balance = pool_balance - ? WHERE guild_id = ?",
+                (msg_reward_amount, message.guild.id)
+            )
+            cursor.execute(
+                "INSERT INTO user_last_message (user_id, guild_id, last_timestamp) VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id, guild_id) DO UPDATE SET last_timestamp=excluded.last_timestamp",
+                (message.author.id, message.guild.id, current_time)
+            )
+            DBConnection.commit()
+
+        except Exception as e:
+            DBConnection.rollback()
+            print(f"An unexpected error occurred during reward payment\n{e.__class__.__name__}\n{e}")
+            raise e
+        finally:
+            if VC_Client and not VC_Client.session.closed:
+                await VC_Client.close()
+
+    except Exception as e:
+        print(f"Error in handle_message_reward\n[{e.__class__.__name__}]\n{e}")
+    finally:
+        cursor.close()
+
 
 def is_admin(interaction: discord.Interaction) -> bool:
     return interaction.user.id in config.Discord.ADMIN
