@@ -256,6 +256,9 @@ async def reward_pool_set(interaction: Interaction, reward_type: str, amount: in
     if amount <= 0 or cooldown_seconds < 0:
         await interaction.followup.send(embed=Embed(title="エラー", description="報酬量とクールダウンは0以上の値を設定してください。", colour=embedColour.Error))
         return
+    if len(reward_type) > 20 or cooldown_seconds > 31557600:
+        await interaction.followup.send(embed=Embed(title="エラー", description="無効な値です", colour=embedColour.Error))
+        return
     
     cursor = DBConnection.cursor()
     try:
