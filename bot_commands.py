@@ -249,7 +249,7 @@ async def reward_pool_init(interaction: Interaction, unit: str):
         if vc_client: await vc_client.close()
 
 @reward_pool.command(name="set", description="報酬ルールを追加または更新します (管理者向け)")
-@app_commands.describe(reward_type="報酬の種類 (例: message, voice_joinなど)", amount="報酬量", cooldown_seconds="次の報酬までの待機時間(秒)")
+@app_commands.describe(reward_type="報酬の種類 (例: message, joinなど)", amount="報酬量", cooldown_seconds="次の報酬までの待機時間(秒)")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def reward_pool_set(interaction: Interaction, reward_type: str, amount: int, cooldown_seconds: int):
     await interaction.response.defer(thinking=True, ephemeral=True)

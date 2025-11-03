@@ -48,4 +48,9 @@ async def on_message(message:discord.Message):
             await client.close()
             exit()
 
+@client.event
+async def on_member_join(member:discord.Member):
+    if member.guild:
+        await cmds.handle_reward('join', member, member.guild)
+
 client.run(config.Discord.BOT_TOKEN)
