@@ -47,7 +47,7 @@ async def create_claim_embed(vc_client:AsyncVirtualCryptoClient, payer_id:int, u
     claim_embed.add_field(name="請求id", value=f"{new_claim.id}")
     claim_embed.add_field(name="数量", value=f"{amount} {unit}")
     claim_embed.add_field(name="内容", value=claim_info, inline=False)
-    claim_embed.add_field(name="承認用コマンド", value=f"/claim approve id:{new_claim.id}", inline=False)
+    claim_embed.add_field(name="承認用コマンド", value=f"```/claim approve id:{new_claim.id}```", inline=False)
     claim_embed.set_footer(text=f"注意: 請求は最大{expire_min}分間有効です")
     return claim_embed, new_claim
 
