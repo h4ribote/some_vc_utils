@@ -10,9 +10,8 @@ from time import time
 class AsyncVirtualCryptoClient(VirtualCryptoClientBase):
     def __init__(self, client_id: str, client_secret: str, scopes: List[Scope]):
         super().__init__(client_id, client_secret, scopes)
-        self.loop = asyncio.get_running_loop()
-        self.session = aiohttp.ClientSession(loop=self.loop)
-        self.wait_ready = asyncio.Event(loop=self.loop)
+        self.session = aiohttp.ClientSession()
+        self.wait_ready = asyncio.Event()
 
     async def wait_for_ready(self):
         await self.wait_ready.wait()
