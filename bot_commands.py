@@ -8,6 +8,7 @@ from time import time
 from typing import Optional
 
 from db_utils import Database
+from db_structs import RewardType
 
 with Database("database.db") as db:
     db.create_tables()
@@ -187,7 +188,7 @@ async def reward_pool_init(interaction: Interaction, unit: str):
 @reward_pool.command(name="set", description="報酬ルールを追加または更新します (管理者向け)")
 @app_commands.describe(reward_type="報酬の種類 (例: message, server_joinなど)", amount="報酬量", cooldown_seconds="次の報酬までの待機時間(秒)")
 @app_commands.checks.has_permissions(manage_guild=True)
-async def reward_pool_set(interaction: Interaction, reward_type: str, amount: int, cooldown_seconds: int):
+async def reward_pool_set(interaction: Interaction, reward_type: RewardType, amount: int, cooldown_seconds: int):
     await interaction.response.defer(thinking=True, ephemeral=True)
     if amount <= 0 or cooldown_seconds < 0:
         await interaction.followup.send(embed=Embed(title="エラー", description="報酬量とクールダウンは0以上の値を設定してください。", colour=embedColour.Error))
@@ -213,7 +214,7 @@ async def reward_pool_set(interaction: Interaction, reward_type: str, amount: in
 @reward_pool.command(name="delete", description="報酬ルールを削除します (管理者向け)")
 @app_commands.describe(reward_type="削除する報酬の種類 (例: message)")
 @app_commands.checks.has_permissions(manage_guild=True)
-async def reward_pool_delete(interaction: Interaction, reward_type: str):
+async def reward_pool_delete(interaction: Interaction, reward_type: RewardType):
     await interaction.response.defer(thinking=True, ephemeral=True)
     try:
         with Database("database.db") as db:
@@ -327,7 +328,7 @@ async def rp_cmd_error(interaction: discord.Interaction, error: app_commands.App
 
 # --- Generic Reward Handler ---
 
-async def handle_reward(reward_type: str, user: discord.Member, guild: discord.Guild):
+async def handle_reward(reward_type: RewardType, user: discord.Member, guild: discord.Guild):
     if user.bot:
         return
 
