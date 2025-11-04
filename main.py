@@ -51,6 +51,6 @@ async def on_message(message:discord.Message):
 @client.event
 async def on_member_join(member:discord.Member):
     if member.guild:
-        await cmds.handle_reward('join', member, member.guild)
+        await cmds.handle_reward('server_join', member, member.guild)
 
 client.run(config.Discord.BOT_TOKEN)
