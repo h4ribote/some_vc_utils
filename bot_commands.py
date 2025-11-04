@@ -7,7 +7,6 @@ import asyncio
 from time import time
 from typing import Optional
 
-from db_structs import RewardPool, RewardConfig, UserRewardCooldown
 from db_utils import Database
 
 with Database("database.db") as db:
