@@ -160,7 +160,7 @@ reward_pool = app_commands.Group(name="reward_pool", description="サーバー�
 @app_commands.describe(unit="報酬として使用する通貨の単位")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def reward_pool_init(interaction: Interaction, unit: str):
-    await interaction.response.defer(thinking=True, ephemeral=True)
+    await interaction.response.defer(thinking=True)
     vc_client = None
     try:
         with Database("database.db") as db:
@@ -189,7 +189,7 @@ async def reward_pool_init(interaction: Interaction, unit: str):
 @app_commands.describe(reward_type="報酬の種類 (例: message, server_joinなど)", amount="報酬量", cooldown_seconds="次の報酬までの待機時間(秒)")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def reward_pool_set(interaction: Interaction, reward_type: RewardType, amount: int, cooldown_seconds: int):
-    await interaction.response.defer(thinking=True, ephemeral=True)
+    await interaction.response.defer(thinking=True)
     if amount <= 0 or cooldown_seconds < 0:
         await interaction.followup.send(embed=Embed(title="エラー", description="報酬量とクールダウンは0以上の値を設定してください。", colour=embedColour.Error))
         return
@@ -215,7 +215,7 @@ async def reward_pool_set(interaction: Interaction, reward_type: RewardType, amo
 @app_commands.describe(reward_type="削除する報酬の種類 (例: message)")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def reward_pool_delete(interaction: Interaction, reward_type: RewardType):
-    await interaction.response.defer(thinking=True, ephemeral=True)
+    await interaction.response.defer(thinking=True)
     try:
         with Database("database.db") as db:
             if db.delete_reward_config(interaction.guild_id, reward_type.lower()) > 0:
