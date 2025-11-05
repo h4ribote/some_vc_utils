@@ -1,0 +1,10 @@
+/config.py
+.env*
+.vscode
+
+*.log
+
+__pycache__/
+*.pyc
+
+database.db

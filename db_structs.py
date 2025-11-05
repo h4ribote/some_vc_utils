@@ -1,5 +1,8 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List, Literal
+
+REWARD_TYPES: List[str] = ['message', 'server_join']
+RewardType = Literal['message', 'server_join']
 
 @dataclass
 class RewardPool:
@@ -21,7 +24,7 @@ class RewardPool:
 class RewardConfig:
     config_id: int
     guild_id: int
-    reward_type: str
+    reward_type: RewardType
     amount: int
     cooldown_seconds: int
 
@@ -41,7 +44,7 @@ class RewardConfig:
 class UserRewardCooldown:
     user_id: int
     guild_id: int
-    reward_type: str
+    reward_type: RewardType
     last_triggered_timestamp: int
 
     @classmethod
