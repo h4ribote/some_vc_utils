@@ -57,3 +57,22 @@ class UserRewardCooldown:
             reward_type=data['reward_type'],
             last_triggered_timestamp=data['last_triggered_timestamp']
         )
+
+@dataclass(frozen=True)
+class RewardReservation:
+    """A reward already deducted from the pool and recorded as a cooldown, awaiting payment."""
+    guild_id: int
+    user_id: int
+    reward_type: str
+    unit: str
+    amount: int
+    timestamp: int
+    previous_timestamp: Optional[int]
+
+@dataclass(frozen=True)
+class PoolUnitChange:
+    """A pool switched from old_unit to new_unit whose old balance must be refunded."""
+    guild_id: int
+    old_unit: str
+    old_balance: int
+    new_unit: str

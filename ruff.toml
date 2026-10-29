@@ -1,0 +1,9 @@
+target-version = "py312"
+# virtualcrypto/ is a vendored third-party package and keeps its upstream style.
+extend-exclude = [".venv", "virtualcrypto"]
+include = ["*.py", "svuctl", "tests/*.py"]
+
+[lint]
+select = ["E4", "E7", "E9", "F", "B006", "B904"]
+# One sentence per physical line is the project's comment rule, so line length is not linted.
+ignore = ["E501"]

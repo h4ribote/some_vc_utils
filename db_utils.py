@@ -1,14 +1,28 @@
 import sqlite3
-from typing import Optional
-from db_structs import RewardPool, RewardConfig, UserRewardCooldown
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator, Optional, Union
+from db_structs import RewardPool, RewardConfig, UserRewardCooldown, RewardReservation, PoolUnitChange
+from settings import DB_PATH
+
+# Seconds a connection waits for another connection's lock (for example a running backup) before failing.
+BUSY_TIMEOUT_SECONDS = 15
+
+
+def init_database(db_path: Union[str, Path, None] = None) -> None:
+    """Create the database file and any missing tables; existing tables are left untouched."""
+    with Database(db_path) as db:
+        db.create_tables()
+
 
 class Database:
-    def __init__(self, db_path: str):
-        self.db_path = db_path
+    def __init__(self, db_path: Union[str, Path, None] = None):
+        self.db_path = Path(db_path) if db_path is not None else DB_PATH
         self.conn = None
 
     def __enter__(self):
-        self.conn = sqlite3.connect(self.db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(self.db_path, timeout=BUSY_TIMEOUT_SECONDS)
         self.conn.row_factory = self._dict_factory
         return self
 
@@ -155,3 +169,91 @@ class Database:
             """,
             (user_id, guild_id, reward_type, timestamp)
         )
+
+    @contextmanager
+    def immediate_transaction(self) -> Iterator[None]:
+        """Run the block in a BEGIN IMMEDIATE transaction, which takes the write lock before the first read."""
+        if self.conn.in_transaction:
+            self.conn.commit()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self.conn.rollback()
+            raise
+        else:
+            self.conn.commit()
+
+    def reserve_reward(self, guild_id: int, user_id: int, reward_type: str, now: int) -> Optional[RewardReservation]:
+        """Atomically check rule, pool balance and cooldown, then deduct the pool and record the cooldown; None when no reward is due."""
+        with self.immediate_transaction():
+            config = self.get_reward_config(guild_id, reward_type)
+            if not config or config.amount <= 0:
+                return None
+            pool = self.get_reward_pool(guild_id)
+            if not pool or pool.pool_balance < config.amount:
+                return None
+            cooldown = self.get_user_reward_cooldown(user_id, guild_id, reward_type)
+            if cooldown and (now - cooldown.last_triggered_timestamp) < config.cooldown_seconds:
+                return None
+            self.withdraw_from_reward_pool(guild_id, config.amount)
+            self.update_user_reward_cooldown(user_id, guild_id, reward_type, now)
+            return RewardReservation(
+                guild_id=guild_id,
+                user_id=user_id,
+                reward_type=reward_type,
+                unit=pool.unit,
+                amount=config.amount,
+                timestamp=now,
+                previous_timestamp=cooldown.last_triggered_timestamp if cooldown else None,
+            )
+
+    def release_reward(self, reservation: RewardReservation) -> tuple[bool, bool]:
+        """Undo a reservation whose payment failed; returns whether the pool and the cooldown were restored."""
+        r = reservation
+        with self.immediate_transaction():
+            # The amount goes back only while the pool still holds the reserved unit.
+            pool_restored = self.conn.execute(
+                "UPDATE reward_pools SET pool_balance = pool_balance + ? WHERE guild_id = ? AND unit = ?",
+                (r.amount, r.guild_id, r.unit)
+            ).rowcount == 1
+            # The cooldown is reverted only if no later reward has overwritten the timestamp written by this reservation.
+            if r.previous_timestamp is None:
+                cursor = self.conn.execute(
+                    "DELETE FROM user_reward_cooldowns WHERE user_id = ? AND guild_id = ? AND reward_type = ? AND last_triggered_timestamp = ?",
+                    (r.user_id, r.guild_id, r.reward_type, r.timestamp)
+                )
+            else:
+                cursor = self.conn.execute(
+                    "UPDATE user_reward_cooldowns SET last_triggered_timestamp = ? WHERE user_id = ? AND guild_id = ? AND reward_type = ? AND last_triggered_timestamp = ?",
+                    (r.previous_timestamp, r.user_id, r.guild_id, r.reward_type, r.timestamp)
+                )
+            return pool_restored, cursor.rowcount == 1
+
+    def change_reward_pool_unit(self, guild_id: int, unit: str) -> Optional[PoolUnitChange]:
+        """Set the pool unit; when a non-empty pool switches unit its balance is zeroed and returned for refunding."""
+        with self.immediate_transaction():
+            pool = self.get_reward_pool(guild_id)
+            if pool and pool.pool_balance > 0 and pool.unit != unit:
+                self.update_reward_pool_unit(guild_id, unit)
+                return PoolUnitChange(guild_id=guild_id, old_unit=pool.unit, old_balance=pool.pool_balance, new_unit=unit)
+            self.init_reward_pool(guild_id, unit)
+            return None
+
+    def revert_reward_pool_unit(self, change: PoolUnitChange) -> bool:
+        """Restore the old unit and balance after a failed refund, provided the pool is still empty in the new unit."""
+        with self.immediate_transaction():
+            return self.conn.execute(
+                "UPDATE reward_pools SET unit = ?, pool_balance = ? WHERE guild_id = ? AND unit = ? AND pool_balance = 0",
+                (change.old_unit, change.old_balance, change.guild_id, change.new_unit)
+            ).rowcount == 1
+
+    def deposit_to_reward_pool_if_unit(self, guild_id: int, unit: str, amount: int) -> tuple[bool, Optional[str]]:
+        """Deposit only if the pool still uses `unit`; returns whether it was deposited and the pool's current unit."""
+        with self.immediate_transaction():
+            pool = self.get_reward_pool(guild_id)
+            current_unit = pool.unit if pool else None
+            if current_unit != unit:
+                return False, current_unit
+            self.deposit_to_reward_pool(guild_id, amount)
+            return True, current_unit

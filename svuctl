@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""Manage the Some VC Utils bot inside its repository: setup, supervised start/stop, status, logs, backup and update.
+
+Uses only the Python standard library, so it runs with the system python3 before .venv exists.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import pwd
+import shlex
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+REPO = Path(__file__).resolve().parent
+SCRIPT = REPO / "svuctl"
+VENV = REPO / ".venv"
+VENV_PYTHON = VENV / "bin" / "python"
+ENV_FILE = REPO / ".env"
+ENV_EXAMPLE = REPO / "deploy" / "env.example"
+REQUIREMENTS = REPO / "requirements.txt"
+DATA_DIR = REPO / "data"
+LOG_DIR = REPO / "logs"
+BACKUP_DIR = REPO / "backups"
+RUN_DIR = REPO / "run"
+PID_FILE = RUN_DIR / "svu.pid"
+STATE_FILE = RUN_DIR / "state.json"
+LOCK_FILE = RUN_DIR / "svu.lock"
+SUPERVISOR_LOG = LOG_DIR / "supervisor.log"
+BOT_LOG = LOG_DIR / "bot.log"
+
+RUN_USER = "svu"
+USERADD_COMMAND = f"useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin {RUN_USER}"
+# Directories the bot may write, with their modes; everything else in the repository stays read-only for the run user.
+WRITABLE_DIRS = {DATA_DIR: 0o700, LOG_DIR: 0o750, BACKUP_DIR: 0o700, RUN_DIR: 0o750}
+
+EXIT_CONFIG_ERROR = 78  # Same value as settings.EXIT_CONFIG_ERROR; the bot uses it for errors a restart cannot fix.
+EXIT_NOT_RUNNING = 3
+BACKOFF_INITIAL_SECONDS = 1.0
+BACKOFF_MAX_SECONDS = 300.0
+STABLE_RUN_SECONDS = 600.0  # A bot run this long resets the restart backoff.
+DEFAULT_STOP_TIMEOUT = 30.0
+START_CONFIRM_SECONDS = 10.0
+SUPERVISOR_LOG_MAX_BYTES = 5 * 1024 * 1024
+SUPERVISOR_LOG_KEEP = 3
+
+# Test hooks read only by tests/test_svuctl.py: a replacement bot command line, and a run user other than svu when invoked as root.
+TEST_BOT_CMD_ENV = "SVU_TEST_BOT_CMD"
+TEST_RUN_USER_ENV = "SVU_TEST_RUN_USER"
+
+
+def fail(message: str, code: int = 1) -> int:
+    print(f"svuctl: {message}", file=sys.stderr)
+    return code
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def format_duration(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    return (f"{days}d " if days else "") + f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def run_user_entry() -> Optional[pwd.struct_passwd]:
+    """The account the bot runs as: svu when invoked as root, otherwise the invoking user (None)."""
+    if os.geteuid() != 0:
+        return None
+    name = os.environ.get(TEST_RUN_USER_ENV) or RUN_USER
+    try:
+        return pwd.getpwnam(name)
+    except KeyError:
+        return None
+
+
+def user_kwargs(entry: Optional[pwd.struct_passwd]) -> dict:
+    """subprocess arguments that run the child as `entry` with a matching environment."""
+    if entry is None:
+        return {}
+    env = dict(os.environ, HOME=entry.pw_dir, USER=entry.pw_name, LOGNAME=entry.pw_name)
+    return {"user": entry.pw_uid, "group": entry.pw_gid, "extra_groups": [], "env": env}
+
+
+def require_run_user() -> Optional[pwd.struct_passwd]:
+    """Return the run user entry, or exit with the useradd command when running as root without one."""
+    entry = run_user_entry()
+    if os.geteuid() == 0 and entry is None:
+        sys.exit(fail(f"user '{RUN_USER}' does not exist; create it with:\n  {USERADD_COMMAND}"))
+    return entry
+
+
+def bot_command() -> list[str]:
+    override = os.environ.get(TEST_BOT_CMD_ENV)
+    if override:
+        return shlex.split(override)
+    return [str(VENV_PYTHON), str(REPO / "main.py")]
+
+
+def proc_cmdline(pid: int) -> list[str]:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [part.decode(errors="replace") for part in raw.split(b"\0") if part]
+
+
+def is_our_supervisor(pid: int) -> bool:
+    """True if pid is a live supervisor of this repository (pid reuse by an unrelated process yields False)."""
+    args = proc_cmdline(pid)
+    return str(SCRIPT) in args and "_supervise" in args
+
+
+def read_pid() -> Optional[int]:
+    try:
+        text = PID_FILE.read_text().strip()
+    except FileNotFoundError:
+        return None
+    except PermissionError:
+        sys.exit(fail(f"cannot read {PID_FILE}; run svuctl as root or as the user running the bot"))
+    return int(text) if text.isdigit() else -1
+
+
+def running_pid(remove_stale: bool) -> Optional[int]:
+    """Return the supervisor pid if it is running; a pid file naming no live supervisor is reported as stale."""
+    pid = read_pid()
+    if pid is None:
+        return None
+    if pid > 0 and is_our_supervisor(pid):
+        return pid
+    reason = f"pid {pid} is not a running supervisor" if pid > 0 else "content is not a pid"
+    if remove_stale:
+        try:
+            PID_FILE.unlink()
+            print(f"svuctl: removed stale pid file {PID_FILE} ({reason})")
+        except FileNotFoundError:
+            pass
+        except PermissionError:
+            sys.exit(fail(f"stale pid file {PID_FILE} cannot be removed; run as root"))
+    else:
+        print(f"svuctl: stale pid file {PID_FILE} ({reason})")
+    return None
+
+
+def read_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_json_atomic(path: Path, data: dict) -> None:
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(path)
+
+
+def tail_lines(path: Path, count: int) -> list[str]:
+    try:
+        with open(path, "rb") as fp:
+            fp.seek(0, os.SEEK_END)
+            size = fp.tell()
+            fp.seek(max(0, size - 64 * 1024))
+            lines = fp.read().decode(errors="replace").splitlines()
+    except OSError:
+        return []
+    return lines[-count:]
+
+
+def wait_for_exit(pid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not is_our_supervisor(pid):
+            return True
+        time.sleep(0.2)
+    return not is_our_supervisor(pid)
+
+
+# Subcommands
+
+def cmd_setup(args) -> int:
+    if not ENV_FILE.is_file():
+        return fail(f"{ENV_FILE} not found; create it from the template and fill in the values, then run setup again:\n  cp {ENV_EXAMPLE} {ENV_FILE}")
+    is_root = os.geteuid() == 0
+    entry = run_user_entry()
+
+    if not VENV_PYTHON.exists():
+        print(f"svuctl: creating virtual environment {VENV}")
+        if subprocess.call([sys.executable, "-m", "venv", str(VENV)]) != 0:
+            return fail("creating the virtual environment failed (on Ubuntu install python3-venv)")
+    print(f"svuctl: installing {REQUIREMENTS.name}")
+    if subprocess.call([str(VENV_PYTHON), "-m", "pip", "install", "--disable-pip-version-check", "-q", "-r", str(REQUIREMENTS)]) != 0:
+        return fail("installing requirements failed")
+
+    for path in WRITABLE_DIRS:
+        path.mkdir(exist_ok=True)
+
+    if is_root and entry is None:
+        print(f"svuctl: user '{RUN_USER}' does not exist, so ownership and permissions were not applied; create it and run setup again:\n  {USERADD_COMMAND}", file=sys.stderr)
+        return 1
+
+    def own(path: str, mode: int) -> None:
+        if is_root:
+            os.chown(path, entry.pw_uid, entry.pw_gid)
+        os.chmod(path, mode)
+
+    if is_root:
+        if REPO.stat().st_uid != 0:
+            print(f"svuctl: warning: {REPO} is not owned by root; the run user must not be able to modify the code", file=sys.stderr)
+        REPO.chmod(REPO.stat().st_mode & ~0o022)
+    for path, mode in WRITABLE_DIRS.items():
+        file_mode = 0o640 if path == LOG_DIR else 0o600
+        for root, dirs, files in os.walk(path):
+            for name in dirs:
+                own(os.path.join(root, name), mode)
+            for name in files:
+                own(os.path.join(root, name), file_mode)
+        own(str(path), mode)
+    own(str(ENV_FILE), 0o400 if is_root else 0o600)
+    owner = entry.pw_name if entry else pwd.getpwuid(os.getuid()).pw_name
+    print(f"svuctl: setup complete; the bot runs as '{owner}', which can write only {', '.join(p.name + '/' for p in WRITABLE_DIRS)}")
+    return 0
+
+
+def cmd_start(args) -> int:
+    if not ENV_FILE.is_file():
+        return fail(f"{ENV_FILE} not found; run: cp {ENV_EXAMPLE} {ENV_FILE}, fill it in, then svuctl setup")
+    if TEST_BOT_CMD_ENV not in os.environ and not VENV_PYTHON.exists():
+        return fail(f"{VENV} not found; run svuctl setup first")
+    if not RUN_DIR.is_dir() or not LOG_DIR.is_dir():
+        return fail("run/ or logs/ is missing; run svuctl setup first")
+    pid = running_pid(remove_stale=True)
+    if pid:
+        return fail(f"already running (supervisor pid {pid})")
+    entry = require_run_user()
+
+    proc = subprocess.Popen(
+        [sys.executable, str(SCRIPT), "_supervise"],
+        cwd=REPO,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        umask=0o027,
+        **user_kwargs(entry),
+    )
+    deadline = time.monotonic() + START_CONFIRM_SECONDS
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            print("\n".join(tail_lines(SUPERVISOR_LOG, 10)), file=sys.stderr)
+            return fail(f"supervisor exited immediately with code {proc.returncode}; see {SUPERVISOR_LOG}")
+        if read_pid() == proc.pid:
+            user = entry.pw_name if entry else pwd.getpwuid(os.getuid()).pw_name
+            print(f"svuctl: started (supervisor pid {proc.pid}, running as {user}); logs in {LOG_DIR}")
+            return 0
+        time.sleep(0.1)
+    return fail(f"supervisor pid {proc.pid} did not write {PID_FILE} within {START_CONFIRM_SECONDS:.0f} s; see {SUPERVISOR_LOG}")
+
+
+def cmd_stop(args) -> int:
+    pid = running_pid(remove_stale=True)
+    if not pid:
+        print("svuctl: not running")
+        return 0
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except PermissionError:
+        return fail(f"no permission to signal supervisor pid {pid}; run as root or as the user running the bot")
+    except ProcessLookupError:
+        print("svuctl: stopped")
+        return 0
+    print(f"svuctl: sent SIGTERM to supervisor pid {pid}; waiting up to {args.timeout:.0f} s")
+    if wait_for_exit(pid, args.timeout):
+        print("svuctl: stopped")
+        return 0
+    print(f"svuctl: supervisor did not stop within {args.timeout:.0f} s; sending SIGKILL to its process group {pid}")
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    wait_for_exit(pid, 5)
+    PID_FILE.unlink(missing_ok=True)
+    print("svuctl: killed; the bot did not shut down cleanly", file=sys.stderr)
+    return 1
+
+
+def cmd_restart(args) -> int:
+    rc = cmd_stop(args)
+    if rc != 0:
+        return rc
+    return cmd_start(args)
+
+
+def cmd_status(args) -> int:
+    pid = running_pid(remove_stale=False)
+    state = read_state()
+    now = time.time()
+    if pid and state.get("supervisor_pid") == pid:
+        print(f"status:     running (supervisor pid {pid}, user {state.get('user', '?')})")
+        print(f"uptime:     {format_duration(now - state.get('started_at', now))} (since {state.get('started_at_utc', '?')})")
+        print(f"restarts:   {state.get('restarts', 0)}")
+        if state.get("bot_pid"):
+            print(f"bot:        pid {state['bot_pid']}, up {format_duration(now - state.get('bot_started_at', now))}")
+        else:
+            print(f"bot:        not running, next start in backoff ({state.get('backoff_seconds', '?')} s)")
+        if state.get("last_exit") is not None:
+            print(f"last exit:  {state['last_exit']} at {state.get('last_exit_utc', '?')}")
+        code = 0
+    elif pid:
+        print(f"status:     running (supervisor pid {pid}, state file unavailable)")
+        code = 0
+    else:
+        print("status:     not running")
+        if state:
+            print(f"last run:   started {state.get('started_at_utc', '?')}, {state.get('restarts', 0)} restart(s), last exit {state.get('last_exit')} at {state.get('last_exit_utc', '?')}")
+        code = EXIT_NOT_RUNNING
+    for path in (BOT_LOG, SUPERVISOR_LOG):
+        lines = tail_lines(path, args.lines)
+        if lines:
+            print(f"--- last {len(lines)} line(s) of {path.relative_to(REPO)}")
+            print("\n".join(lines))
+    return code
+
+
+def cmd_logs(args) -> int:
+    path = SUPERVISOR_LOG if args.supervisor else BOT_LOG
+    if not path.exists():
+        return fail(f"{path} does not exist yet")
+    cmd = ["tail", "-n", str(args.lines)] + (["-F"] if args.follow else []) + [str(path)]
+    os.execvp(cmd[0], cmd)
+
+
+def cmd_backup(args) -> int:
+    entry = require_run_user()
+    python = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
+    return subprocess.call([python, str(REPO / "backup.py")], cwd=REPO, umask=0o077, **user_kwargs(entry))
+
+
+def cmd_update(args) -> int:
+    was_running = running_pid(remove_stale=False) is not None
+    print("svuctl: git pull --ff-only")
+    if subprocess.call(["git", "-C", str(REPO), "pull", "--ff-only"]) != 0:
+        return fail("git pull failed; nothing was changed")
+    # The freshly pulled svuctl performs the remaining steps.
+    rc = subprocess.call([sys.executable, str(SCRIPT), "setup"])
+    if rc != 0:
+        return fail("setup after update failed; the bot was left as it was")
+    if was_running:
+        return subprocess.call([sys.executable, str(SCRIPT), "restart", "--timeout", str(args.timeout)])
+    print("svuctl: updated; the bot was not running, start it with: svuctl start")
+    return 0
+
+
+# Supervisor
+
+class Supervisor:
+    """Runs the bot, restarts it after a non-zero exit with exponential backoff, and forwards SIGTERM/SIGINT to it."""
+
+    def __init__(self):
+        self.child: Optional[subprocess.Popen] = None
+        self.stop_requested = False
+        self.log_fp = None
+        self.state = {
+            "supervisor_pid": os.getpid(),
+            "user": pwd.getpwuid(os.getuid()).pw_name,
+            "started_at": time.time(),
+            "started_at_utc": utc_now(),
+            "restarts": 0,
+            "bot_pid": None,
+            "bot_started_at": None,
+            "last_exit": None,
+            "last_exit_utc": None,
+            "backoff_seconds": None,
+        }
+
+    def log(self, message: str) -> None:
+        self.log_fp.write(f"{utc_now()} supervisor[{os.getpid()}]: {message}\n")
+        self.log_fp.flush()
+
+    def open_log(self, rotate: bool = True) -> None:
+        if self.log_fp:
+            self.log_fp.close()
+        if rotate and SUPERVISOR_LOG.exists() and SUPERVISOR_LOG.stat().st_size > SUPERVISOR_LOG_MAX_BYTES:
+            for i in range(SUPERVISOR_LOG_KEEP - 1, 0, -1):
+                older = SUPERVISOR_LOG.with_name(f"{SUPERVISOR_LOG.name}.{i}")
+                if older.exists():
+                    older.replace(SUPERVISOR_LOG.with_name(f"{SUPERVISOR_LOG.name}.{i + 1}"))
+            SUPERVISOR_LOG.replace(SUPERVISOR_LOG.with_name(f"{SUPERVISOR_LOG.name}.1"))
+        self.log_fp = open(SUPERVISOR_LOG, "a", encoding="utf-8")
+
+    def save_state(self) -> None:
+        write_json_atomic(STATE_FILE, self.state)
+
+    def on_signal(self, signum, frame) -> None:
+        self.stop_requested = True
+        child = self.child
+        if child is not None and child.returncode is None:
+            try:
+                os.kill(child.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+    def sleep(self, seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while not self.stop_requested and time.monotonic() < deadline:
+            time.sleep(min(0.2, deadline - time.monotonic()))
+
+    def run(self) -> int:
+        lock_fp = open(LOCK_FILE, "a")
+        try:
+            fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self.open_log(rotate=False)
+            self.log("another supervisor holds the lock; exiting")
+            return 1
+        self.open_log()
+        signal.signal(signal.SIGTERM, self.on_signal)
+        signal.signal(signal.SIGINT, self.on_signal)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        PID_FILE.write_text(f"{os.getpid()}\n")
+        self.save_state()
+        self.log(f"started as user {self.state['user']}; bot command: {' '.join(bot_command())}")
+        try:
+            return self.loop()
+        except BaseException as e:
+            self.log(f"supervisor crashed: {type(e).__name__}: {e}")
+            raise
+        finally:
+            if self.child is not None and self.child.poll() is None:
+                self.child.kill()
+                self.child.wait()
+            if read_pid() == os.getpid():
+                PID_FILE.unlink(missing_ok=True)
+            self.state["bot_pid"] = None
+            self.save_state()
+            self.log("supervisor exiting")
+            lock_fp.close()
+
+    def loop(self) -> int:
+        backoff = BACKOFF_INITIAL_SECONDS
+        while not self.stop_requested:
+            self.open_log()
+            started = time.monotonic()
+            self.child = subprocess.Popen(bot_command(), cwd=REPO, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=self.log_fp)
+            if self.stop_requested:
+                os.kill(self.child.pid, signal.SIGTERM)
+            self.state.update(bot_pid=self.child.pid, bot_started_at=time.time(), backoff_seconds=None)
+            self.save_state()
+            self.log(f"bot started (pid {self.child.pid})")
+            rc = self.child.wait()
+            ran = time.monotonic() - started
+            self.state.update(bot_pid=None, last_exit=rc, last_exit_utc=utc_now())
+            self.save_state()
+            self.log(f"bot exited with code {rc} after {ran:.1f} s")
+            if self.stop_requested:
+                self.log("stop requested; not restarting")
+                return 0
+            if rc == 0:
+                self.log("bot exited cleanly; supervisor stops")
+                return 0
+            if rc == EXIT_CONFIG_ERROR:
+                self.log(f"bot reported a configuration error (exit {EXIT_CONFIG_ERROR}); not restarting, fix .env and run svuctl start")
+                return 0
+            if ran >= STABLE_RUN_SECONDS:
+                backoff = BACKOFF_INITIAL_SECONDS
+            self.state.update(restarts=self.state["restarts"] + 1, backoff_seconds=backoff)
+            self.save_state()
+            self.log(f"restart {self.state['restarts']} in {backoff:g} s")
+            self.sleep(backoff)
+            backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
+        self.log("stop requested during backoff")
+        return 0
+
+
+def cmd_supervise(args) -> int:
+    return Supervisor().run()
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    # The internal supervisor entry point started by "start" is kept out of the help output.
+    if argv == ["_supervise"]:
+        return cmd_supervise(None)
+    parser = argparse.ArgumentParser(prog="svuctl", description="Manage the Some VC Utils bot in " + str(REPO))
+    sub = parser.add_subparsers(dest="command", required=True, metavar="command")
+    sub.add_parser("setup", help="create .venv, install requirements, create data/ logs/ backups/ run/ and apply permissions").set_defaults(func=cmd_setup)
+    sub.add_parser("start", help="start the supervised bot in the background").set_defaults(func=cmd_start)
+    for name, func, text in (("stop", cmd_stop, "stop the bot (SIGTERM, then SIGKILL after the timeout)"), ("restart", cmd_restart, "stop, then start")):
+        p = sub.add_parser(name, help=text)
+        p.add_argument("--timeout", type=float, default=DEFAULT_STOP_TIMEOUT, help="seconds to wait before SIGKILL (default %(default)s)")
+        p.set_defaults(func=func)
+    p = sub.add_parser("status", help="show whether the bot runs, uptime, restarts and recent log lines")
+    p.add_argument("-n", "--lines", type=int, default=10, help="log lines to show (default %(default)s)")
+    p.set_defaults(func=cmd_status)
+    p = sub.add_parser("logs", help="show or follow the bot log")
+    p.add_argument("-f", "--follow", action="store_true", help="keep following the log")
+    p.add_argument("-n", "--lines", type=int, default=50, help="lines to show (default %(default)s)")
+    p.add_argument("--supervisor", action="store_true", help="show the supervisor log instead")
+    p.set_defaults(func=cmd_logs)
+    sub.add_parser("backup", help="write a consistent database backup to backups/ now").set_defaults(func=cmd_backup)
+    p = sub.add_parser("update", help="git pull --ff-only, reinstall requirements, restart if running")
+    p.add_argument("--timeout", type=float, default=DEFAULT_STOP_TIMEOUT, help="stop timeout for the restart (default %(default)s)")
+    p.set_defaults(func=cmd_update)
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,84 +1,149 @@
 from .structs import Currency, Scope, Claim, ClaimStatus, Balance
-from .errors import MissingScope, BadRequest, NotFound
+from .errors import MissingScope, BadRequest, NotFound, HTTPException
 from .client import VirtualCryptoClientBase, VIRTUALCRYPTO_TOKEN_ENDPOINT, VIRTUALCRYPTO_API
-from typing import Optional, List
+from dataclasses import dataclass
+from typing import Any, Optional, List
 import aiohttp
 import asyncio
-from time import time
+from time import monotonic
+
+# A token is renewed this many seconds before its stated expiry so that no request is sent with a token about to lapse.
+TOKEN_REFRESH_MARGIN_SECONDS = 60
+REQUEST_TIMEOUT_SECONDS = 30
+
+
+@dataclass
+class APIResponse:
+    status: int
+    data: Any
+
+    @property
+    def ok(self) -> bool:
+        return 200 <= self.status < 300
 
 
 class AsyncVirtualCryptoClient(VirtualCryptoClientBase):
+    """Long-lived client: start() opens the HTTP session, the OAuth token is fetched on first use and renewed before expiry or after a 401."""
+
     def __init__(self, client_id: str, client_secret: str, scopes: List[Scope]):
         super().__init__(client_id, client_secret, scopes)
-        self.session = aiohttp.ClientSession()
+        self.session: Optional[aiohttp.ClientSession] = None
         self.wait_ready = asyncio.Event()
+        self._token_lock = asyncio.Lock()
+        self._token_deadline = 0.0
 
     async def wait_for_ready(self):
         await self.wait_ready.wait()
 
     async def start(self):
-        await self.set_token()
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS))
         self.wait_ready.set()
 
     async def close(self):
-        await self.session.close()
+        if self.session is not None and not self.session.closed:
+            await self.session.close()
+
+    def _require_session(self) -> aiohttp.ClientSession:
+        if self.session is None or self.session.closed:
+            raise RuntimeError("AsyncVirtualCryptoClient is not started")
+        return self.session
 
     async def set_token(self):
         body = {
             'scope': ' '.join(map(lambda x: x.value, self.scopes)),
             'grant_type': 'client_credentials'
         }
-        async with self.session.post(
+        async with self._require_session().post(
                 VIRTUALCRYPTO_TOKEN_ENDPOINT,
                 data=body,
-                auth=aiohttp.BasicAuth(self.client_id, self.client_secret)) as response:
-            data = await response.json()
+                headers={"Authorization": aiohttp.encode_basic_auth(self.client_id, self.client_secret)}) as response:
+            status = response.status
+            try:
+                data = await response.json(content_type=None)
+            except ValueError:
+                data = None
+        if status != 200 or not isinstance(data, dict) or 'access_token' not in data:
+            error = data.get('error') if isinstance(data, dict) else None
+            raise HTTPException(f"token request failed with HTTP {status}" + (f" ({error})" if error else ""), status)
 
         self.token = data['access_token']
-        self.expires_in = data['expires_in']
+        self.expires_in = int(data['expires_in'])
         self.token_type = data['token_type']
-        self.when_set_token = int(time())
+        self.when_set_token = monotonic()
+        self._token_deadline = self.when_set_token + max(0, self.expires_in - TOKEN_REFRESH_MARGIN_SECONDS)
+
+    async def _ensure_token(self, stale_token: Optional[str] = None):
+        async with self._token_lock:
+            # Another task may have renewed the token while this one waited for the lock.
+            if self.token is None or self.token == stale_token or monotonic() >= self._token_deadline:
+                await self.set_token()
 
     async def get_headers(self):
-        if (int(time()) - self.when_set_token) >= self.expires_in:
-            await self.set_token()
+        await self._ensure_token()
         return {
             "Authorization": "Bearer " + self.token
         }
 
-    async def get(self, path, params) -> aiohttp.ClientResponse:
-        headers = await self.get_headers()
+    async def _request(self, method: str, path: str, **kwargs) -> APIResponse:
+        """Send a request and read its body; a 401 renews the token and retries once, since the server rejected the request unprocessed."""
+        for attempt in range(2):
+            headers = await self.get_headers()
+            token = self.token
+            async with self._require_session().request(method, VIRTUALCRYPTO_API + path, headers=headers, **kwargs) as response:
+                status = response.status
+                try:
+                    data = await response.json(content_type=None)
+                except ValueError:
+                    data = None
+            if status == 401 and attempt == 0:
+                await self._ensure_token(stale_token=token)
+                continue
+            return APIResponse(status, data)
+        return APIResponse(status, data)
 
-        return await self.session.get(VIRTUALCRYPTO_API + path, params=params, headers=headers)
+    @staticmethod
+    def _raise_for_status(response: APIResponse, error_key: str = "error_description"):
+        if response.ok:
+            return
+        detail = response.data.get(error_key) if isinstance(response.data, dict) else None
+        message = detail or f"HTTP {response.status}"
+        if response.status == 400:
+            raise BadRequest(message, response.status)
+        if response.status == 404:
+            raise NotFound(message, response.status)
+        raise HTTPException(message, response.status)
 
-    async def post(self, path, data) -> aiohttp.ClientResponse:
-        headers = await self.get_headers()
-        return await self.session.post(VIRTUALCRYPTO_API + path, data=data, headers=headers)
+    async def get(self, path, params) -> APIResponse:
+        return await self._request("GET", path, params=params)
 
-    async def patch(self, path, data) -> aiohttp.ClientResponse:
-        headers = await self.get_headers()
-        return await self.session.patch(VIRTUALCRYPTO_API + path, data=data, headers=headers)
+    async def post(self, path, data) -> APIResponse:
+        return await self._request("POST", path, data=data)
+
+    async def patch(self, path, data) -> APIResponse:
+        return await self._request("PATCH", path, data=data)
 
     async def get_currency_by_unit(self, unit: str) -> Optional[Currency]:
         response = await self.get("/currencies", {"unit": unit})
 
-        return Currency.by_json(await response.json())
+        return Currency.by_json(response.data)
 
     async def get_currency_by_guild(self, guild_id: int) -> Optional[Currency]:
         response = await self.get("/currencies", {"guild": str(guild_id)})
 
-        return Currency.by_json(await response.json())
+        return Currency.by_json(response.data)
 
     async def get_currency_by_name(self, name: str) -> Optional[Currency]:
         response = await self.get("/currencies", {"name": name})
-        return Currency.by_json(await response.json())
+        return Currency.by_json(response.data)
 
     async def get_currency(self, currency_id: int):
         response = await self.get("/currencies/" + str(currency_id), {})
 
-        return Currency.by_json(await response.json())
+        return Currency.by_json(response.data)
 
     async def create_user_transaction(self, unit: str, receiver_discord_id: int, amount: int) -> None:
+        """Pay `amount` of `unit`; any non-2xx response raises, so a return means the server accepted the payment."""
         if Scope.Pay not in self.scopes:
             raise MissingScope("vc.pay")
 
@@ -90,8 +155,7 @@ class AsyncVirtualCryptoClient(VirtualCryptoClientBase):
                 "amount": str(amount)
             }
         )
-        if response.status == 400:
-            raise BadRequest((await response.json())["error_info"])
+        self._raise_for_status(response, "error_info")
 
     pay = create_user_transaction
 
@@ -100,9 +164,8 @@ class AsyncVirtualCryptoClient(VirtualCryptoClientBase):
             "/users/@me/claims",
             {"payer_discord_id":str(payer_discord_id),"unit":unit,"amount":str(amount)}
         )
-        if response.status == 400:
-            raise BadRequest((await response.json())["error_description"])
-        return Claim.by_json(await response.json())
+        self._raise_for_status(response)
+        return Claim.by_json(response.data)
 
     async def get_claims(self):
         if Scope.Claim not in self.scopes:
@@ -112,11 +175,13 @@ class AsyncVirtualCryptoClient(VirtualCryptoClientBase):
             "/users/@me/claims",
             {}
         )
-        return list(map(Claim.by_json, await response.json()))
+        self._raise_for_status(response)
+        return list(map(Claim.by_json, response.data))
 
     async def get_claim(self, claim_id: int):
         response = await self.get("/users/@me/claims/" + str(claim_id), {})
-        return Claim.by_json(await response.json())
+        self._raise_for_status(response)
+        return Claim.by_json(response.data)
 
     async def update_claim(self, claim_id: int, status: ClaimStatus):
         if status == ClaimStatus.Pending:
@@ -126,12 +191,7 @@ class AsyncVirtualCryptoClient(VirtualCryptoClientBase):
             "/users/@me/claims/" + str(claim_id),
             {"status": status.value}
         )
-
-        if response.status == 404:
-            raise NotFound((await response.json())["error_description"])
-        elif response.status == 400:
-            raise BadRequest((await response.json())["error_info"])
-
+        self._raise_for_status(response, "error_info" if response.status == 400 else "error_description")
         return response
 
     async def get_balances(self):
@@ -139,4 +199,5 @@ class AsyncVirtualCryptoClient(VirtualCryptoClientBase):
             "/users/@me/balances",
             {}
         )
-        return list(map(Balance.by_json, await response.json()))
+        self._raise_for_status(response)
+        return list(map(Balance.by_json, response.data))

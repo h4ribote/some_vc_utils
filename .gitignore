@@ -1,10 +1,15 @@
-/config.py
-.env*
+.env
+.env.*
+.venv/
+/data/
+/logs/
+/backups/
+/run/
 .vscode
 
 *.log
 
 __pycache__/
 *.pyc
-
-database.db
+.pytest_cache/
+.ruff_cache/
