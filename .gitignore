@@ -1,16 +1,19 @@
 .env
 .env.*
+!.env.example
+!.env.*.example
 .venv/
-/data/
-/logs/
-/backups/
-/run/
 .vscode
 local/
+tmp/
 
 *.log
+*.db
 
 __pycache__/
 *.pyc
+*.egg-info/
+build/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/

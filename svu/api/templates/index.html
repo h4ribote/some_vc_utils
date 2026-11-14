@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>管理できるサーバー</h1>
+{% if guilds %}
+<ul class="guilds">
+  {% for guild in guilds %}
+  <li>
+    <a class="guild" href="/guilds/{{ guild.guild_id }}">
+      {% if guild.icon %}<img class="icon" src="https://cdn.discordapp.com/icons/{{ guild.guild_id }}/{{ guild.icon }}.png?size=64" alt="">{% else %}<span class="icon icon-blank">{{ guild.name[:1] }}</span>{% endif %}
+      <span>{{ guild.name }}</span>
+    </a>
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="muted">サーバーの管理権限を持ち、Botが参加しているサーバーがありません。</p>
+{% endif %}
+{% endblock %}

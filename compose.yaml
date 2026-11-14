@@ -1,0 +1,112 @@
+name: svu
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+# Only migrate declares build, so "docker compose build" builds the shared image once.
+x-app: &app
+  image: svu:local
+  pull_policy: never
+  env_file: .env
+  logging: *logging
+
+services:
+  postgres:
+    image: postgres:17
+    # The cluster is created on first start with the application's user, password and database from .env, so the application owns its database.
+    environment:
+      POSTGRES_DB: ${SVU_DB_NAME:-svu}
+      POSTGRES_USER: ${SVU_DB_USER:-svu}
+      POSTGRES_PASSWORD: ${SVU_DB_PASSWORD:?SVU_DB_PASSWORD must be set in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --host=127.0.0.1 --username=\"$${POSTGRES_USER}\" --dbname=\"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+    logging: *logging
+
+  migrate:
+    <<: *app
+    build: .
+    command: ["migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *app
+    command: ["api"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  bot:
+    <<: *app
+    command: ["bot"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    # Covers closing the gateway connection, which takes longer than docker's default 10 second grace.
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  # The worker points the VirtualCrypto webhook at the API, and VirtualCrypto verifies it at once, so the worker starts after the API is healthy.
+  worker:
+    <<: *app
+    command: ["worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      api:
+        condition: service_healthy
+    volumes:
+      - backups:/var/lib/svu/backups
+    # Covers the scheduler's drain of running jobs before they are cancelled.
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  # On-demand backups and restores: "docker compose run --rm backup" or "docker compose run --rm backup restore <file>".
+  backup:
+    <<: *app
+    command: ["backup"]
+    profiles: ["tools"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - backups:/var/lib/svu/backups
+    restart: "no"
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.10.6
+    command: ["tunnel", "--no-autoupdate", "run"]
+    # TUNNEL_TOKEN comes from .env.cloudflared, which no other service reads; cloudflared exits with an error when it is missing or empty.
+    env_file:
+      - path: .env.cloudflared
+        required: true
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *logging
+
+volumes:
+  pgdata:
+  backups:
