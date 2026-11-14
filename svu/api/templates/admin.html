@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}管理 - Some VC Utils{% endblock %}
+{% block content %}
+<h1>管理</h1>
+<section class="card">
+  <h2>VirtualCryptoアプリ</h2>
+  {% if app_state %}
+  <table>
+    <tr><th>Webhook URL</th><td><code>{{ app_state.webhook_url or "未設定" }}</code></td></tr>
+    <tr><th>最後に確認できた日時</th><td>{{ app_state.webhook_verified_at.strftime("%Y-%m-%d %H:%M") ~ " UTC" if app_state.webhook_verified_at else "なし" }}</td></tr>
+    <tr><th>最後に確認できなかった日時</th><td>{{ app_state.webhook_failed_at.strftime("%Y-%m-%d %H:%M") ~ " UTC" if app_state.webhook_failed_at else "なし" }}</td></tr>
+    <tr><th>同期</th><td>{{ app_state.synced_at.strftime("%Y-%m-%d %H:%M") }} UTC</td></tr>
+  </table>
+  {% else %}
+  <p class="warn">workerがまだVirtualCryptoのアプリ情報を同期していません。</p>
+  {% endif %}
+</section>
+<section class="card">
+  <h2>対応が必要な支払い</h2>
+  <p class="muted">結果不明の支払いは、VirtualCryptoの履歴で確認してから記録してください。「支払われていない」と記録すると補償 (返金やプールへの戻し) が行われます。</p>
+  <table>
+    <tr><th>作成</th><th>用途</th><th>受取人</th><th class="num">金額</th><th>状態</th><th>エラー</th><th></th></tr>
+    {% for p in attention %}
+    <tr>
+      <td>{{ p.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
+      <td>{{ PURPOSE_LABELS[p.purpose] }}</td>
+      <td><code>{{ p.receiver_id }}</code></td>
+      <td class="num">{{ p.amount | amount(p.unit) }}</td>
+      <td><span class="status status-{{ p.status }}">{{ STATUS_LABELS.get(p.status, p.status) }}</span></td>
+      <td class="error">{{ p.last_error or "" }}</td>
+      <td>
+        {% if p.status == "unknown" %}
+        <form method="post" action="/admin/payouts/{{ p.id }}/resolve" class="inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf }}">
+          <input type="hidden" name="outcome" value="paid">
+          <button type="submit" class="link">支払い済み</button>
+        </form>
+        <form method="post" action="/admin/payouts/{{ p.id }}/resolve" class="inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf }}">
+          <input type="hidden" name="outcome" value="not_paid">
+          <button type="submit" class="link danger">支払われていない</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="7" class="muted">ありません。</td></tr>
+    {% endfor %}
+  </table>
+</section>
+{% endblock %}

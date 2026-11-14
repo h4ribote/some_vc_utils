@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+{% block title %}{{ guild.name }} - Some VC Utils{% endblock %}
+{% block content %}
+<h1>{{ guild.name }}</h1>
+
+<div class="grid">
+  <section class="card">
+    <h2>支払い元</h2>
+    {% if settings.funding_source == "issue" %}
+      {% if grant %}
+      <p>サーバーの発行枠から <strong>{{ grant.unit }}</strong> を直接発行しています。</p>
+      {% else %}
+      <p class="warn">発行枠が選ばれていますが、発行の許可がないため報酬は止まっています。</p>
+      {% endif %}
+    {% else %}
+      <p>Botのウォレットのプールから {% if settings.reward_unit %}<strong>{{ settings.reward_unit }}</strong> で{% endif %}支払います。</p>
+    {% endif %}
+    {% if pending_request %}
+    <p class="notice">承認待ちの発行許可: サーバーでVirtualCryptoの <code>/grant approve code:{{ pending_request.user_code }}</code> を実行してください。</p>
+    {% endif %}
+    <form method="post" action="/guilds/{{ guild.guild_id }}/source" class="row">
+      <input type="hidden" name="csrf_token" value="{{ csrf }}">
+      <select name="source">
+        <option value="wallet" {% if settings.funding_source == "wallet" %}selected{% endif %}>Botのウォレット</option>
+        <option value="issue" {% if settings.funding_source == "issue" %}selected{% endif %}>サーバーの発行枠</option>
+      </select>
+      <button type="submit">切り替える</button>
+    </form>
+    {% if settings.funding_source == "wallet" %}
+    <form method="post" action="/guilds/{{ guild.guild_id }}/unit" class="row">
+      <input type="hidden" name="csrf_token" value="{{ csrf }}">
+      <input name="unit" placeholder="通貨の単位" value="{{ settings.reward_unit or '' }}" required maxlength="64">
+      <button type="submit">報酬の通貨を設定</button>
+    </form>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>プール残高</h2>
+    {% if balances %}
+    <table>
+      <tr><th>通貨</th><th class="num">残高</th></tr>
+      {% for b in balances %}<tr><td>{{ b.unit }}</td><td class="num">{{ "{:,}".format(b.balance) }}</td></tr>{% endfor %}
+    </table>
+    {% else %}
+    <p class="muted">残高はありません。</p>
+    {% endif %}
+    <form method="post" action="/guilds/{{ guild.guild_id }}/deposit" class="row">
+      <input type="hidden" name="csrf_token" value="{{ csrf }}">
+      <input name="unit" placeholder="通貨" value="{{ settings.reward_unit or '' }}" required maxlength="64">
+      <input name="amount" type="number" min="1" placeholder="数量" required>
+      <button type="submit">請求で入金</button>
+    </form>
+    <form method="post" action="/guilds/{{ guild.guild_id }}/withdraw" class="row">
+      <input type="hidden" name="csrf_token" value="{{ csrf }}">
+      <input name="unit" placeholder="通貨" required maxlength="64">
+      <input name="amount" type="number" min="1" placeholder="数量" required>
+      <button type="submit" class="secondary">自分に引き出す</button>
+    </form>
+  </section>
+</div>
+
+<section class="card">
+  <h2>報酬ルール</h2>
+  <table>
+    <tr><th>対象</th><th class="num">報酬</th><th class="num">間隔 (秒)</th><th></th></tr>
+    {% for rule in rules %}
+    <tr>
+      <td>{{ REWARD_LABELS[rule.reward_type] }}</td>
+      <td class="num">{{ "{:,}".format(rule.amount) }}</td>
+      <td class="num">{{ rule.cooldown_seconds }}</td>
+      <td>
+        <form method="post" action="/guilds/{{ guild.guild_id }}/rules/delete" class="inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf }}">
+          <input type="hidden" name="reward_type" value="{{ rule.reward_type }}">
+          <button type="submit" class="link danger">削除</button>
+        </form>
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="4" class="muted">ルールはありません。</td></tr>
+    {% endfor %}
+  </table>
+  <form method="post" action="/guilds/{{ guild.guild_id }}/rules" class="row">
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <select name="reward_type">{% for t in reward_types %}<option value="{{ t }}">{{ REWARD_LABELS[t] }}</option>{% endfor %}</select>
+    <input name="amount" type="number" min="1" placeholder="報酬" required>
+    <input name="cooldown_seconds" type="number" min="0" max="31536000" placeholder="間隔 (秒)" required>
+    <button type="submit">保存</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>最近の操作</h2>
+  <table>
+    <tr><th>日時</th><th>種類</th><th>依頼者</th><th class="num">金額</th><th>状態</th></tr>
+    {% for op in operations %}
+    <tr>
+      <td>{{ op.created_at.strftime("%Y-%m-%d %H:%M") }} UTC</td>
+      <td>{{ KIND_LABELS[op.kind] }}</td>
+      <td><code>{{ op.requester_id }}</code></td>
+      <td class="num">{{ op.amount | amount(op.unit) }}</td>
+      <td><span class="status status-{{ op.status }}">{{ STATUS_LABELS[op.status] }}</span></td>
+    </tr>
+    {% else %}
+    <tr><td colspan="5" class="muted">操作はありません。</td></tr>
+    {% endfor %}
+  </table>
+</section>
+
+<div class="grid">
+  <section class="card">
+    <h2>最近の支払い</h2>
+    <table>
+      <tr><th>日時</th><th>用途</th><th>受取人</th><th class="num">金額</th><th>状態</th></tr>
+      {% for p in payouts %}
+      <tr>
+        <td>{{ p.created_at.strftime("%m-%d %H:%M") }}</td>
+        <td>{{ PURPOSE_LABELS[p.purpose] }}</td>
+        <td><code>{{ p.receiver_id }}</code></td>
+        <td class="num">{{ p.amount | amount(p.unit) }}</td>
+        <td><span class="status status-{{ p.status }}">{{ STATUS_LABELS.get(p.status, p.status) }}</span></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="muted">支払いはありません。</td></tr>
+      {% endfor %}
+    </table>
+  </section>
+  <section class="card">
+    <h2>プールの記録</h2>
+    <table>
+      <tr><th>日時</th><th>内容</th><th class="num">増減</th></tr>
+      {% for e in entries %}
+      <tr>
+        <td>{{ e.created_at.strftime("%m-%d %H:%M") }}</td>
+        <td>{{ ENTRY_LABELS[e.kind] }}</td>
+        <td class="num {% if e.delta < 0 %}neg{% else %}pos{% endif %}">{{ "{:+,}".format(e.delta) }} {{ e.unit }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="3" class="muted">記録はありません。</td></tr>
+      {% endfor %}
+    </table>
+  </section>
+</div>
+{% endblock %}

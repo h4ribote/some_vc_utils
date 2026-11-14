@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}個人設定 - Some VC Utils{% endblock %}
+{% block content %}
+<h1>個人設定</h1>
+<section class="card">
+  <h2>メッセージの受け取り</h2>
+  <p>{% if receive_dm %}/send で届くメッセージをDMで受け取ります。{% else %}/send で届くメッセージを受け取りません。受け取らない間は、あなた宛ての /send は使えません。{% endif %}</p>
+  <form method="post" action="/me/dm" class="row">
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <input type="hidden" name="enabled" value="{% if receive_dm %}off{% else %}on{% endif %}">
+    <button type="submit">{% if receive_dm %}受け取らない{% else %}受け取る{% endif %}</button>
+  </form>
+</section>
+<section class="card">
+  <h2>あなたの操作</h2>
+  <table>
+    <tr><th>日時</th><th>種類</th><th>請求ID</th><th class="num">金額</th><th>状態</th></tr>
+    {% for op in operations %}
+    <tr>
+      <td>{{ op.created_at.strftime("%Y-%m-%d %H:%M") }} UTC</td>
+      <td>{{ KIND_LABELS[op.kind] }}</td>
+      <td>{% if op.claim_id %}<code>{{ op.claim_id }}</code>{% endif %}</td>
+      <td class="num">{{ op.amount | amount(op.unit) }}</td>
+      <td><span class="status status-{{ op.status }}">{{ STATUS_LABELS[op.status] }}</span></td>
+    </tr>
+    {% else %}
+    <tr><td colspan="5" class="muted">操作はありません。</td></tr>
+    {% endfor %}
+  </table>
+</section>
+{% endblock %}
