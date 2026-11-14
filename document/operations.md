@@ -205,14 +205,23 @@ psql "postgresql://svu@127.0.0.1:15432/svu"
 
 ## 旧版からの移行
 
-旧版 (SQLite と `svuctl` で動いていたもの) の `data/database.db` を取り込める。取り込めるのは空のデータベースだけである。
+旧版 (SQLite で動いていたもの) の `database.db` を取り込める。取り込めるのは空のデータベースだけである。
 ファイルはコンテナのユーザー (UID 10001) が読めるようにしておく (例 `chmod 644 database.db`)。
 
 ```
 docker compose up -d postgres migrate
-docker compose run --rm -v "$PWD/database.db:/import/database.db:ro" migrate import-sqlite /import/database.db
+docker compose run --rm -v "$PWD/database.db:/import/database.db:ro" migrate import-sqlite --match-wallet --dry-run /import/database.db
+docker compose run --rm -v "$PWD/database.db:/import/database.db:ro" migrate import-sqlite --match-wallet /import/database.db
 docker compose up -d
 ```
+
+`--dry-run` は取り込む内容を表示してから取り消し、何も書き込まない。
+
+`--match-wallet` は、Bot のウォレットの実際の残高を VirtualCrypto から読み、各通貨のプール残高の合計をそれに合わせる。
+旧版は VirtualCrypto v3 への切り替え後、送金の失敗を成功として扱っていたため、受取人に届かなかった報酬の分だけ、記録上のプール残高が実際のウォレットより少ない。
+差額は、その通貨を使う唯一のサーバーのプールに加えられ、取り込みの記録の金額に含まれる。
+どのプールも使わない通貨の残高はウォレットに残り、表示だけされる。
+ウォレットがプールの記録より少ない場合と、差額のある通貨を複数のサーバーが使う場合は、取り込みを拒否する。
 
 | 旧版のテーブル | 取り込み先 |
 | --- | --- |

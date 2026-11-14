@@ -119,6 +119,11 @@ class VCClient:
         body = await self._app("GET", "/api/v2/users/@me/claims", params=params)
         return [Claim.from_json(item) for item in body or []]
 
+    async def balances(self) -> dict[str, int]:
+        """The application's own wallet, by unit; VirtualCrypto omits units the account muted or does not hold."""
+        body = await self._app("GET", "/api/v2/users/@me/balances")
+        return {str(item["currency"]["unit"]): int(item["amount"]) for item in body or []}
+
     async def currency_by_unit(self, unit: str) -> Currency | None:
         return await self._currency({"unit": unit})
 

@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from svu.core import guilds, pool, users
 from svu.db.tables import reward_cooldowns
-from svu.importer import SQLiteImportError, import_sqlite
+from svu.importer import SQLiteImportError, import_sqlite, match_wallet
 
 # The previous bot's schema, as its db_utils.create_tables wrote it.
 LEGACY_SCHEMA = """
@@ -43,6 +43,35 @@ async def test_import_copies_the_previous_database(db: AsyncEngine, tmp_path: Pa
         assert await users.receives_dm(conn, 22)
         stamp = await conn.scalar(select(reward_cooldowns.c.last_rewarded_at))
         assert stamp is not None and int(stamp.timestamp()) == 1700000000
+
+
+async def test_matching_the_wallet_raises_the_pool_and_reports_strays(db: AsyncEngine, tmp_path: Path) -> None:
+    report = await import_sqlite(db, legacy_db(tmp_path / "database.db"), wallet={"nyan": 800, "wan": 0, "vcl": 7})
+    assert [(a.guild_id, a.unit, a.recorded, a.imported) for a in report.adjustments] == [(11, "nyan", 500, 800)]
+    assert report.unassigned == {"vcl": 7}
+    async with db.connect() as conn:
+        assert await pool.balance(conn, 11, "nyan") == 800
+        assert [(e.kind, e.delta) for e in await pool.entries(conn, 11)] == [("import", 800)]
+
+
+async def test_a_wallet_short_of_the_pools_is_refused(db: AsyncEngine, tmp_path: Path) -> None:
+    with pytest.raises(SQLiteImportError, match="holds 100 nyan"):
+        await import_sqlite(db, legacy_db(tmp_path / "database.db"), wallet={"nyan": 100})
+
+
+def test_a_surplus_in_a_shared_unit_cannot_be_assigned() -> None:
+    with pytest.raises(SQLiteImportError, match="2 guilds use nyan"):
+        match_wallet({1: ("nyan", 10), 2: ("nyan", 0)}, {"nyan": 20})
+    balances, adjustments, _ = match_wallet({1: ("nyan", 10), 2: ("nyan", 5)}, {"nyan": 15})
+    assert balances == {1: 10, 2: 5} and adjustments == []
+
+
+async def test_a_dry_run_writes_nothing(db: AsyncEngine, tmp_path: Path) -> None:
+    report = await import_sqlite(db, legacy_db(tmp_path / "database.db"), wallet={"nyan": 800}, dry_run=True)
+    assert report.rules == 1
+    async with db.connect() as conn:
+        assert await pool.balance(conn, 11, "nyan") == 0
+        assert await guilds.rules(conn, 11) == []
 
 
 async def test_import_refuses_a_database_that_already_has_data(db: AsyncEngine, tmp_path: Path) -> None:

@@ -14,11 +14,13 @@ from svu.core import payouts, users
 from svu.core.operations import Operation
 
 AMOUNT_MAX = 2**63 - 1
+# Discord refuses integer options whose bounds exceed this, so a slash command amount is limited to it.
+DISCORD_INTEGER_MAX = 2**53 - 1
 # A rain pays at most this many members, which keeps its claim and its payouts bounded.
 RAIN_MAX_MEMBERS = 5000
 SEND_MESSAGE_MAX = 1000
 
-Amount = app_commands.Range[int, 1, AMOUNT_MAX]
+Amount = app_commands.Range[int, 1, DISCORD_INTEGER_MAX]
 
 
 async def show_operation(interaction: discord.Interaction[Any], op: Operation) -> None:

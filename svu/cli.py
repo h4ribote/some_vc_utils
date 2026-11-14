@@ -86,20 +86,36 @@ def _restore(settings: Settings, args: argparse.Namespace) -> int:
 def _import_sqlite(settings: Settings, args: argparse.Namespace) -> int:
     from svu.db.engine import create_engine
     from svu.importer import SQLiteImportError, import_sqlite
+    from svu.vc import VCClient
+
+    if args.match_wallet:
+        settings.require("vc_client_id", "vc_client_secret")
 
     async def run() -> int:
+        wallet = None
+        if args.match_wallet:
+            vc = VCClient(settings.vc_base_url, settings.secret("vc_client_id"), settings.secret("vc_client_secret"))
+            try:
+                wallet = await vc.balances()
+            finally:
+                await vc.close()
         engine = create_engine(settings.database_url)
         try:
-            report = await import_sqlite(engine, Path(args.file))
+            report = await import_sqlite(engine, Path(args.file), wallet=wallet, dry_run=args.dry_run)
         except SQLiteImportError as exc:
             print(f"Import refused: {exc}", file=sys.stderr)
             return EXIT_FAILURE
         finally:
             await engine.dispose()
+        verb = "Would import" if args.dry_run else "Imported"
         print(
-            f"Imported {report.guilds} guilds ({report.balances} pool balances), {report.rules} reward rules"
+            f"{verb} {report.guilds} guilds ({report.balances} pool balances), {report.rules} reward rules"
             f" ({report.skipped_rules} skipped), {report.cooldowns} cooldowns and {report.users} DM opt-ins."
         )
+        for adj in report.adjustments:
+            print(f"Pool of guild {adj.guild_id} raised from {adj.recorded} to {adj.imported} {adj.unit} to match the wallet.")
+        for unit, amount in report.unassigned.items():
+            print(f"The wallet also holds {amount} {unit}, which no pool uses; it stays in the wallet.")
         return EXIT_OK
 
     return asyncio.run(run())
@@ -159,6 +175,8 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("file", help="Backup file name in the backup directory, or an absolute path.")
         if name == "import-sqlite":
             sub.add_argument("file", help="Path of the previous database.db inside the container.")
+            sub.add_argument("--match-wallet", action="store_true", help="Raise each pool to what the bot's VirtualCrypto wallet holds in its unit.")
+            sub.add_argument("--dry-run", action="store_true", help="Report what would be imported, then roll back.")
     return parser
 
 
