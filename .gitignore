@@ -6,6 +6,7 @@
 /backups/
 /run/
 .vscode
+local/
 
 *.log
 
